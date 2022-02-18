@@ -1,0 +1,234 @@
+"""Message Broker"""
+from typing import Dict, List, Any, Tuple
+import socket
+import selectors
+
+import enum
+import logging
+import sys
+
+import logging
+from .protocol import CDProto, CDProtoBadFormat, Serializer
+logging.basicConfig(level=logging.DEBUG,
+                    format='%(asctime)s %(levelname)-8s %(message)s',
+                    datefmt='%m-%d %H:%M',
+                    filename='Broker.log',
+                    filemode='w')
+LOGGER = logging.getLogger()
+
+
+class Broker:
+    """Implementation of a PubSub Message Broker."""
+
+
+    def __init__(self):
+        """Initialize broker."""
+        self.canceled = False
+        self._host = "localhost"
+        self._port = 3001
+
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind((self._host,self._port))
+
+        self.sock.listen(100)
+        self.sel = selectors.DefaultSelector()
+        self.sel.register(self.sock, selectors.EVENT_READ, self.accept)
+
+        LOGGER.info("Listen @ %s:%s", self._host, self._port)
+        self.topics = []       # Also includes subtopics [weater2, /weather2/temp ,/weather2/temp/Celsius , weather, weather/temp]
+        self.topics_value = {} #
+        self.subscribers = {}  # topic : List[socket.socket]
+        self.typeFormat = {}   # socket : _format
+
+
+
+    def accept(self, sock: socket.socket, mask):
+        """ Accept a connection """
+        conn, addr = sock.accept()
+        LOGGER.info("ACCEPTED CON from add %s Still with no Format ", addr)
+
+        try:
+            self.sel.register(conn, selectors.EVENT_READ, self.parse_message)
+        except KeyError as e:
+            pass
+        conn.setblocking(False)
+
+
+    def send_message(self, conn, msg_s):
+        try:
+            CDProto.send_msg(conn, msg_s)
+        except ConnectionResetError as e:
+            for topics in self.subscribers.keys():
+                if (socket_c,self.typeFormat[socket_c]) in self.subscribers[topics]:
+                    self.subscribers[topics].remove((socket_c,self.typeFormat[socket_c]))
+            self.sel.unregister(socket_c)
+            socket_c.close()
+        except BrokenPipeError as e:
+            for topics in self.subscribers.keys():
+                if (socket_c,self.typeFormat[socket_c]) in self.subscribers[topics]:
+                    self.subscribers[topics].remove((socket_c,self.typeFormat[socket_c]))
+            socket_c.close()
+            self.sel.unregister(socket_c)
+
+    def parse_message(self, socket_c: socket.socket, mask):
+        """READS a message and uses it's method to determine what to do just like run in DHTNODE"""
+        # Specific method to read a message and return a dictionary of the keys and values the message head
+        args = None
+        try:
+            s_format = self.typeFormat[socket_c]
+        except KeyError as e:
+            s_format = None
+
+        try:
+            if s_format :
+                args = CDProto.recv_msg(socket_c, s_format)
+            else:
+                args = CDProto.recv_msg(socket_c)
+        except ConnectionResetError as e:
+            for topics in self.subscribers.keys():
+                if (socket_c,self.typeFormat[socket_c]) in self.subscribers[topics]:
+                    self.subscribers[topics].remove((socket_c,self.typeFormat[socket_c]))
+            socket_c.close()
+            self.sel.unregister(socket_c)
+        except BrokenPipeError as e:
+            for topics in self.subscribers.keys():
+                if (socket_c,self.typeFormat[socket_c]) in self.subscribers[topics]:
+                    self.subscribers[topics].remove((socket_c,self.typeFormat[socket_c]))
+            socket_c.close()
+            self.sel.unregister(socket_c)
+
+
+        if args:
+            if isinstance(args, str):
+                if args == "JSON":
+                    self.typeFormat[socket_c] = Serializer.JSON
+                if args == "PICKLE":
+                    self.typeFormat[socket_c] = Serializer.PICKLE
+                if args == "XML":
+                    self.typeFormat[socket_c] = Serializer.XML
+            else:
+                LOGGER.error("Message Received : %s",args)
+                if args["method"] == "GET_TOPIC":
+                    pass
+                elif args["method"] == "ACK_GET":
+                    # I will never receive this but better safe than sorry
+                    LOGGER.error("Message of type ACK GET was received", args)
+
+                elif args["method"] == "PUT_TOPIC":
+                    self.put_topic(args["topic"], args["value"])
+
+                    socket_list = self.list_subscriptions(args["topic"])
+                    for s in socket_list:
+                        msg = CDProto.getTopicRep(args["topic"], args["value"])
+                        msg_s = CDProto.serializeMsg(msg, s[1])
+                        self.send_message(s[0], msg_s)
+
+
+                elif args["method"] == "LIST_TOPICS":
+                    msg = CDProto.listRep(self.topics)
+                    msg_s = CDProto.serializeMsg(msg, self.typeFormat[socket_c])
+                    self.send_message(socket_c, msg_s)
+
+                elif args["method"] == "ACK_LIST":
+                    # I will never receive this but better safe than sorry
+                    LOGGER.error("You are not suppossed to do that %s", args )
+
+                elif args["method"] == "SUBSCRIBE":
+                    self.subscribe(args["topic"],socket_c, self.typeFormat[socket_c])
+                    LOGGER.error(args)
+                    value = self.get_topic(args["topic"])
+
+                    if value: #if the value exists add to a topic
+                        msg = CDProto.getTopicRep(args["topic"], value )
+                        msg_s = CDProto.serializeMsg(msg, self.typeFormat[socket_c])
+                        self.send_message(socket_c, msg_s)
+
+                elif args["method"] == "UNSUBSCRIBE":
+                    self.unsubscribe(args["topic"], socket_c)
+
+                else:
+                    LOGGER.error(args["method"])
+                    LOGGER.error("Pretty sure that thats illegal")
+        else:
+            for topics in self.subscribers.keys():
+                    if (socket_c,self.typeFormat[socket_c]) in self.subscribers[topics]:
+                        self.subscribers[topics].remove((socket_c,self.typeFormat[socket_c]))
+            socket_c.close()
+            try:
+                self.sel.unregister(socket_c)
+            except ValueError as e:
+                print(socket_c)
+
+
+
+
+
+
+    def list_topics(self) -> List[str]:
+        """Returns a list of strings containing all topics."""
+        list_topics = [t for t in self.topics]
+        return list_topics
+
+    def get_topic(self, topic):
+        """Returns the currently stored value in topic."""
+        #if the topic wasn't stored yet
+        if topic not in self.topics_value.keys():
+            return None
+        return self.topics_value[topic]
+
+    def put_topic(self, topic, value):
+        """Store in topic the value."""
+
+        LOGGER.info("Setting %s with value %s", topic, value)
+        self.topics_value[topic] = value
+        if not topic in self.topics:
+            self.topics.append(topic)
+
+
+    def list_subscriptions(self, topic: str) -> List[socket.socket]:
+        """Provide list of subscribers to a given topic."""
+        list_subs = [x for x in self.subscribers.keys() if topic.startswith(x)]
+        socket_list = []
+        for topic in list_subs:
+            for tuple_socket in self.subscribers[topic]:
+                socket_list.append(tuple_socket)
+        return socket_list
+
+
+
+    def subscribe(self, topic: str, address: socket.socket, _format: Serializer = None):
+        """Subscribe to topic by client in address."""
+        if topic in self.subscribers:
+            if  not ((address,_format) in self.subscribers[topic]):
+                self.subscribers[topic].append((address, _format))
+
+        else:
+            # topic didn't exist
+            self.subscribers[topic] = list() # create a new set to hold info
+            # adds a socket to this topic
+            self.subscribers[topic].append((address, _format)) #  see above comment
+
+
+    def unsubscribe(self, topic, address):
+        """Unsubscribe to topic by client in address."""
+        LOGGER.error(self.subscribers)
+        if self.subscribers[topic]: # checks if a topic exists
+            """ topic will take on the value of each topic and lists will take
+                a value of a set which holds **subscriptors only**
+            """
+            for topic_name in self.subscribers.keys():
+                socket_list = self.subscribers[topic_name]
+                for socket_add, serial in socket_list:
+                    if address == socket_add:
+                        self.subscribers[topic_name].remove((socket_add, serial))
+
+
+
+    def run(self):
+        """Run until canceled."""
+        while not self.canceled:
+            event = self.sel.select()
+            for k, mask in event:
+                callback = k.data
+                callback(k.fileobj, mask)
